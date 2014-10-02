@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
 """
-Created on Thu Sep 25 09:01:18 2014
+Created on Mon Sep 29 14:36:14 2014
 
-@author: robert.w.smith08@gmail.com
+@author: A421356
 """
 
 import abc
@@ -12,151 +12,170 @@ import datetime
 
 
 class User(object):
+    """
+    Internal class to hold connection details and generate the connection keyword
+    arguments and / or  connection strings as properties
+    """
 
     __metaclass__ = abc.ABCMeta
 
     def __init__(self, **kwargs):
-        self.driver = None
-        self.dsn = None
-        self.host = None
-        self.uid = None
-        self.pwd = None
-        self.autocommit = None
-        for key in self.__dict__.keys():
-            self.__dict__[key] = kwargs.get(key)
-        if not isinstance(self.autocommit, bool):
-            self.autocommit = True
-
-    def __del__(self):
-        del self.driver
-        del self.dsn
-        del self.uid
-        del self.pwd
-        del self.autocommit
-
-    def __getitem__(self, name):
-        return self.__dict__[name]
-
-    def __setitem__(self, name, value):
-        set_val = None
-        if name in self.__dict__.keys():
-            if name == "autocommit" and isinstance(value, bool):
-                set_val = True
-            elif isinstance(value, str):
-                set_val = True
-            else:
-                outval = None
-                if name == "autocommit":
-                    outval = bool
-                else:
-                    outval = str
-                raise ValueError("field {0) must be type {1}".format(name, repr(outval)))
-        else:
-            raise AttributeError("field {0} not found in {1}".format(name, self.__class__.__name__))
-        if set_val:
-            self.__dict__[name] = value
+        self.driver = kwargs.get('driver')
+        # dsn, uid and pwd must be provided.
+        self.dsn = kwargs.get('dsn') or ''
+        self.uid = kwargs.get('uid') or ''
+        self.pwd = kwargs.get('pwd') or ''
+        self.database = kwargs.get('database')
+        self.autocommit = kwargs.get('autocommit')
+        self.ansi = kwargs.get('ansi')
+        self.unicode_results = kwargs.get('unicode_results')
+        # freeze the instance against type changes to existing variables or
+        # additional fields
+        self._is_frozen = True
 
     @property
     def connection_kwargs(self):
-        return {key: value for key, value in self.__dict__.items() if value is not None}
+        """
+        Property returns dict of keys and values relevant to pyodbc.connection
+        """
+        return {key: value for key, value in self.__dict__.items() if not key.startswith('_') and value is not None}
+
+    @property
+    def connection_string(self):
+        """
+        Minimal connection string
+        """
+        return 'DSN={0};UID={1};PWD={2};'.format(self.dsn, self.uid, self.pwd)
+
 
 class Connection(User):
+    """
+    Connection object holds connection, and properly closes when it goes out of
+    scope.
+    Allows user to avoid reconnecting to run multiple queries, speeding up results.
+    """
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         self._conn = None
-        self._conn_ts = None
+
+
 
     def __del__(self):
+        """
+        Attempts to properly close the connection
+        """
         self.close()
-        del self._conn
-        del self._conn_ts
-        super().__del__()
+        self._conn = None
 
     @property
     def connection(self):
-        if self.is_alive:
+        """
+        Returns stored connection object -- if external connection is closed, object's
+        connection may be closed as well.
+        Object attempts to pool and preserve a connection.
+        """
+        if isinstance(self._conn, pyodbc.Connection):
             return self._conn
         else:
-            self._conn = pyodbc.connect(**self.connection_kwargs)
-            self._conn_ts = datetime.datetime.now()
-            return self._conn
+            return self.__connect()
 
+    def __connect(self):
+        """
+        Internal connection logic.
+        Only connection property should call this method.
+        """
+        if isinstance(self._conn, pyodbc.Connection):
+            self._conn.close()
+        self._conn = None
+        try:
+            self._conn = pyodbc.connect(**self.connection_kwargs)
+            return self._conn
+        except pyodbc.DatabaseError as err:
+            error, = err.args()
+            sys.stderr(error)
+            self.close()
+            raise err
+
+    @property
     def cursor(self):
+        """
+        Cursor property creates a cursor from the connection property.
+        Connection property confirms connection status, so cursor just needs to
+        be concerned with if a cursor can or can not be created.
+        """
         return self.connection.cursor()
 
     def close(self):
+        """
+        Close method calls the pyodbc Connection's close function (if self._conn
+        is a Connection).
+        Variables are returned to 'None' / Inital state
+        """
         if isinstance(self._conn, pyodbc.Connection):
             self._conn.close()
         self._conn = None
         self._conn_ts = None
 
     def execute(self, query, header = False):
-        my_cursor = None
+        """
+        Executes query and acts as a iterable list over the result set.
+        """
         if not isinstance(query, str):
             raise TypeError("query must be {0}".format(repr(str)))
         if not isinstance(header, bool):
             raise TypeError("header must be {0}".format(repr(bool)))
-        try:
-            my_cursor = self.cursor()
-            my_cursor.execute(query)
+        with self.cursor.execute(query) as query_res:
             if header:
-                yield tuple(val[0] for val in my_cursor.description)
-            for row in my_cursor:
+                yield tuple(val[0] for val in query_res.description)
+            for row in query_res:
                 yield row
-        except pyodbc.DatabaseError as err:
-            error, = err.args()
-            sys.stderr(error)
-            self.close()
-            raise err
-        finally:
-            del my_cursor
+            # update the connection timestamp to the time of the last successful
+            # query completion
+            self._conn_ts = datetime.datetime.now()
+            query_res.commit()
 
-    @property
-    def is_alive(self):
-        output_bool = None
-        if not isinstance(self._conn_ts, datetime.datetime):
-            output_bool = False
-        elif not isinstance(self.conn, pyodbc.Connection):
-            output_bool = False
-        elif datetime.datetime.now() > self._conn_ts + datetime.timedelta(minutes=10) and isinstance(self.conn, pyodbc.Connection):
-            output_bool = False
-        else:
-            my_cursor = self.cursor()
-            if not isinstance(my_cursor, pyodbc.Cursor):
-                output_bool = False
-            try:
-                res = my_cursor.execute('SELECT 1;').fetchall()
-                if res == (1,):
-                    self._conn_ts = datetime.datetime.now()
-                    output_bool = True
-            except pyodbc.DatabaseError as err:
-                output_bool = False
-                error, = err.args()
-                sys.stderr(error)
-        return output_bool
 
-    def __connect(self):
-            try:
-                if not self.is_alive:
-                    self._conn = None
-                    self._conn = pyodbc.connect(**self.connection_kwargs)
-            except pyodbc.DatabaseError as err:
-                error, = err.args()
-                sys.stderr(error)
-                raise err
-            finally:
-                return self._conn
+############################## BEGIN TESTS ####################################
+
+import unittest
+
+
+class Test_User(unittest.TestCase):
+
+    my_dsn = "LCLPSQL"
+    my_uid = "rob"
+    my_pwd = "1234Abc"
+    my_database = "rob"
+
+    def test_connection_kwargs(self):
+        test_user = User(dsn = self.my_dsn, uid = self.my_uid, pwd = self.my_pwd, database = self.my_database)
+        expected_result = {'dsn': self.my_dsn, 'uid': self.my_uid, 'pwd': self.my_pwd, 'database': self.my_database}
+        self.assertEqual(test_user.connection_kwargs, expected_result)
+
+    def test_connection_string(self):
+        test_user = User(dsn = self.my_dsn, uid = self.my_uid, pwd = self.my_pwd, database = self.my_database)
+        expected_result = "DSN={0};UID={1};PWD={2};".format(self.my_dsn, self.my_uid, self.my_pwd)
+        self.assertEqual(test_user.connection_string, expected_result)
+
+
+class Test_Connection(unittest.TestCase):
+
+    postgres_db = {'dsn': 'LCLPSQL', 'uid': 'rob', 'pwd':'4344', 'database': 'rob'}
+    teradata_db = {'dsn': 'EDWTDDEV', 'uid': 'A421356', 'pwd': 'Middle12'}
+
+    def test_connection(self):
+        my_conn = Connection(**self.postgres_db)
+        expected_result = (1, )
+
+        my_output = [val for val in my_conn.execute('SELECT 1;')]
+        my_result = tuple(my_output[0])
+        self.assertEqual(my_result, expected_result)
+
+
+
+############################## END TESTS ######################################
 
 
 if __name__ == "__main__":
-    conn = Connection(dsn = 'LCLPSQL', uid = 'rob', pwd = '4344')
-    query = """
-    select
-        current_date
-    """
-    for row in conn.execute(query):
-        print(row)
-    del conn
-
-
+    unittest.main()

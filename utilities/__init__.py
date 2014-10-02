@@ -7,5 +7,8 @@ Created on Wed Sep 24 14:47:34 2014
 
 from .connection import Connection
 from .flatfile import StreamWriter
+from .commandline import CommandArg, SapQuery
 
-__all__ = ['Connection', 'StreamWriter']
+__all__ = ['Connection', 'StreamWriter', 'CommandArg', 'SapQuery']
+
+
